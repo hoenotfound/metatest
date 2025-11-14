@@ -1,0 +1,8 @@
+[server]
+headless = true
+runOnSave = true
+port = 8501
+
+[theme]
+base = "light"
+primaryColor = "#1877F2"
