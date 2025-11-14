@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timedelta
+import importlib
+import importlib.util
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
-import google.generativeai as genai  # Gemini
 
 from urllib.parse import urlencode
 from i18n import TRANSLATIONS, metric_keys, t
@@ -297,7 +298,9 @@ FB_REDIRECT_URI = _cfg("FB_REDIRECT_URI", "https://dasmarketing.streamlit.app/")
 FB_SCOPES = ["ads_read"]  # add "business_management" if you need broader listing/asset mgmt
 
 GEMINI_API_KEY = _cfg("GEMINI_API_KEY")  # from st.secrets or env
-if GEMINI_API_KEY:
+genai = None
+if GEMINI_API_KEY and importlib.util.find_spec("google.generativeai") is not None:
+    genai = importlib.import_module("google.generativeai")
     genai.configure(api_key=GEMINI_API_KEY)
 
 def style_fig(fig, *, height=400, showlegend=True):
@@ -538,180 +541,212 @@ def _best_preview_url_for_ad(ad_id: str) -> str | None:
 
 import secrets
 
-def fb_login_url() -> str:
-    """Generate Facebook OAuth login URL - no state verification needed"""
+
+def fb_login_url(state: str | None = None) -> str:
+    """Generate Facebook OAuth login URL with CSRF state token."""
+
     params = {
         "client_id": FB_APP_ID,
         "redirect_uri": FB_REDIRECT_URI,  # Must match EXACTLY in token exchange
         "response_type": "code",
         "scope": ",".join(FB_SCOPES),
     }
+    if state:
+        params["state"] = state
     return f"https://www.facebook.com/v20.0/dialog/oauth?{urlencode(params)}"
 
 
 def fb_exchange_code_for_token(code: str) -> dict:
     """Exchange authorization code for access token"""
-    r = requests.get(
-        "https://graph.facebook.com/v20.0/oauth/access_token",
-        params={
-            "client_id": FB_APP_ID,
-            "redirect_uri": FB_REDIRECT_URI,  # MUST match the OAuth dialog request
-            "client_secret": FB_APP_SECRET,
-            "code": code,
-        },
-        timeout=20,
-    )
-    r.raise_for_status()
-    return r.json()
+
+    try:
+        response = requests.get(
+            "https://graph.facebook.com/v20.0/oauth/access_token",
+            params={
+                "client_id": FB_APP_ID,
+                "redirect_uri": FB_REDIRECT_URI,  # MUST match the OAuth dialog request
+                "client_secret": FB_APP_SECRET,
+                "code": code,
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError("Failed to exchange Facebook authorization code") from exc
+
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise RuntimeError("Facebook authorization response was not valid JSON") from exc
 
 
 def fb_long_lived_token(short_token: str) -> dict:
     """Exchange short-lived token for long-lived token (~60 days)"""
-    r = requests.get(
-        "https://graph.facebook.com/v20.0/oauth/access_token",
-        params={
-            "grant_type": "fb_exchange_token",
-            "client_id": FB_APP_ID,
-            "client_secret": FB_APP_SECRET,
-            "fb_exchange_token": short_token,
-        },
-        timeout=20,
-    )
-    r.raise_for_status()
-    return r.json()
+
+    try:
+        response = requests.get(
+            "https://graph.facebook.com/v20.0/oauth/access_token",
+            params={
+                "grant_type": "fb_exchange_token",
+                "client_id": FB_APP_ID,
+                "client_secret": FB_APP_SECRET,
+                "fb_exchange_token": short_token,
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError("Failed to upgrade to a long-lived Facebook token") from exc
+
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise RuntimeError("Facebook long-lived token response was not valid JSON") from exc
 
 
 def fb_api_get(path: str, token: str, **params) -> dict:
     """Make authenticated request to Facebook Graph API"""
-    r = requests.get(
-        f"https://graph.facebook.com/v20.0/{path.lstrip('/')}",
-        params=params,
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json()
+
+    try:
+        response = requests.get(
+            f"https://graph.facebook.com/v20.0/{path.lstrip('/')}",
+            params=params,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=30,
+        )
+        response.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"Facebook API request failed for '{path}'") from exc
+
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"Facebook API response for '{path}' was not valid JSON") from exc
 
 def detect_anomalies(daily_df: pd.DataFrame, campaigns_df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Simple rule based checks for obvious problems.
-        Returns a small dataframe with columns:
-        level, metric, when, detail, suggestion
-        """
-        issues = []
+    """
+    Simple rule based checks for obvious problems.
+    Returns a small dataframe with columns:
+    level, metric, when, detail, suggestion
+    """
 
-        if daily_df is None or daily_df.empty:
-            return pd.DataFrame(columns=["level", "metric", "when", "detail", "suggestion"])
+    issues: list[dict[str, str]] = []
 
-        df = daily_df.copy()
-        df = df.sort_values("date_start")
+    if daily_df is None or daily_df.empty:
+        return pd.DataFrame(columns=["level", "metric", "when", "detail", "suggestion"])
 
-        if "impressions" not in df.columns or "clicks" not in df.columns:
-            return pd.DataFrame(columns=["level", "metric", "when", "detail", "suggestion"])
+    df = daily_df.copy()
+    if "date_start" not in df.columns:
+        return pd.DataFrame(columns=["level", "metric", "when", "detail", "suggestion"])
+    df["date_start"] = pd.to_datetime(df["date_start"], errors="coerce")
+    df = df[df["date_start"].notna()].sort_values("date_start")
 
-        # Compute daily CTR and CPM
-        df["ctr"] = np.where(df["impressions"] > 0, df["clicks"] / df["impressions"], 0.0)
-        if "spend" in df.columns:
-            df["cpm"] = np.where(df["impressions"] > 0, df["spend"] * 1000.0 / df["impressions"], 0.0)
-        else:
-            df["cpm"] = 0.0
+    if df.empty or "impressions" not in df.columns or "clicks" not in df.columns:
+        return pd.DataFrame(columns=["level", "metric", "when", "detail", "suggestion"])
 
-        # 1) Sudden CTR drop vs previous period
-        if len(df) >= 5:
-            last_row = df.iloc[-1]
-            prev = df.iloc[:-1]
-            prev_ctr_mean = prev["ctr"].mean()
-            if prev_ctr_mean > 0 and last_row["ctr"] < prev_ctr_mean * 0.6:
-                drop_pct = (1.0 - last_row["ctr"] / prev_ctr_mean) * 100.0
+    # Compute daily CTR and CPM
+    df["ctr"] = np.where(df["impressions"] > 0, df["clicks"] / df["impressions"], 0.0)
+    if "spend" in df.columns:
+        df["cpm"] = np.where(df["impressions"] > 0, df["spend"] * 1000.0 / df["impressions"], 0.0)
+    else:
+        df["cpm"] = 0.0
+
+    # 1) Sudden CTR drop vs previous period
+    if len(df) >= 5:
+        last_row = df.iloc[-1]
+        prev = df.iloc[:-1]
+        prev_ctr_mean = prev["ctr"].mean()
+        if prev_ctr_mean > 0 and last_row["ctr"] < prev_ctr_mean * 0.6:
+            drop_pct = (1.0 - last_row["ctr"] / prev_ctr_mean) * 100.0
+            issues.append({
+                "level": "high",
+                "metric": "CTR",
+                "when": last_row["date_start"].strftime("%Y-%m-%d"),
+                "detail": f"Daily CTR dropped about {drop_pct:.0f} percent vs recent average.",
+                "suggestion": "Refresh creatives and test new hooks or thumbnails. Also review targeting.",
+            })
+
+    # 2) Spend spike vs recent average
+    if "spend" in df.columns and df["spend"].sum() > 0 and len(df) >= 5:
+        last_row = df.iloc[-1]
+        prev = df.iloc[:-1]
+        prev_spend_mean = prev["spend"].mean()
+
+        if prev_spend_mean > 0 and last_row["spend"] > prev_spend_mean * 1.8:
+            spike_pct = (last_row["spend"] / prev_spend_mean - 1.0) * 100.0
+            issues.append({
+                "level": "medium",
+                "metric": "Spend",
+                "when": last_row["date_start"].strftime("%Y-%m-%d"),
+                "detail": f"Daily spend spiked about {spike_pct:.0f} percent vs recent average.",
+                "suggestion": "Check if this is intentional. If not, review budget caps and bid strategy.",
+            })
+
+    # 3) Sudden zero conversions (LPV or messages) after having some
+    conv_cols = []
+    if "landing_page_view" in df.columns:
+        conv_cols.append("landing_page_view")
+    if "messaging_conversation_starts" in df.columns:
+        conv_cols.append("messaging_conversation_starts")
+
+    if conv_cols and len(df) >= 5:
+        last_rows = df.tail(2)
+        prev = df.iloc[:-2]
+        for col in conv_cols:
+            prev_avg = prev[col].mean()
+            recent_sum = last_rows[col].sum()
+            if prev_avg > 0.5 and recent_sum == 0:
+                pretty_name = "Landing page views" if col == "landing_page_view" else "Message conversations"
                 issues.append({
                     "level": "high",
-                    "metric": "CTR",
-                    "when": last_row["date_start"].strftime("%Y-%m-%d"),
-                    "detail": f"Daily CTR dropped about {drop_pct:.0f} percent vs recent average.",
-                    "suggestion": "Refresh creatives and test new hooks or thumbnails. Also review targeting."
+                    "metric": pretty_name,
+                    "when": f"{last_rows.iloc[0]['date_start'].strftime('%Y-%m-%d')} to {last_rows.iloc[-1]['date_start'].strftime('%Y-%m-%d')}",
+                    "detail": f"{pretty_name} dropped to zero after having consistent activity before.",
+                    "suggestion": "Check pixel or event tracking, landing page, and ad links. Something may be broken.",
                 })
 
-        # 2) Spend spike vs recent average
-        if "spend" in df.columns and df["spend"].sum() > 0 and len(df) >= 5:
-            last_row = df.iloc[-1]
-            prev = df.iloc[:-1]
-            prev_spend_mean = prev["spend"].mean()
+    # Campaign level checks
+    if campaigns_df is not None and not campaigns_df.empty:
+        camp = campaigns_df.copy()
+        camp = to_numeric(camp, ["impressions", "reach", "spend", "ctr"])
 
-            if prev_spend_mean > 0 and last_row["spend"] > prev_spend_mean * 1.8:
-                spike_pct = (last_row["spend"] / prev_spend_mean - 1.0) * 100.0
+        # 4) High frequency campaigns
+        if "impressions" in camp.columns and "reach" in camp.columns:
+            camp["frequency"] = np.where(camp["reach"] > 0, camp["impressions"] / camp["reach"], 0.0)
+            noisy = camp[camp["frequency"] >= 4.0]
+            for _, row in noisy.iterrows():
+                cname = row.get("campaign_name", "Unnamed campaign")
+                freq = row["frequency"]
                 issues.append({
                     "level": "medium",
-                    "metric": "Spend",
-                    "when": last_row["date_start"].strftime("%Y-%m-%d"),
-                    "detail": f"Daily spend spiked about {spike_pct:.0f} percent vs recent average.",
-                    "suggestion": "Check if this is intentional. If not, review budget caps and bid strategy."
+                    "metric": "Frequency",
+                    "when": "whole period",
+                    "detail": f"Campaign \"{cname}\" has high frequency around {freq:.1f}.",
+                    "suggestion": "Consider refreshing creative or expanding audience to avoid fatigue.",
                 })
 
-        # 3) Sudden zero conversions (LPV or messages) after having some
-        conv_cols = []
-        if "landing_page_view" in df.columns:
-            conv_cols.append("landing_page_view")
-        if "messaging_conversation_starts" in df.columns:
-            conv_cols.append("messaging_conversation_starts")
-
-        if conv_cols and len(df) >= 5:
-            last_rows = df.tail(2)
-            prev = df.iloc[:-2]
-            for col in conv_cols:
-                prev_avg = prev[col].mean()
-                recent_sum = last_rows[col].sum()
-                if prev_avg > 0.5 and recent_sum == 0:
-                    pretty_name = "Landing page views" if col == "landing_page_view" else "Message conversations"
-                    issues.append({
-                        "level": "high",
-                        "metric": pretty_name,
-                        "when": f"{last_rows.iloc[0]['date_start'].strftime('%Y-%m-%d')} to {last_rows.iloc[-1]['date_start'].strftime('%Y-%m-%d')}",
-                        "detail": f"{pretty_name} dropped to zero after having consistent activity before.",
-                        "suggestion": "Check pixel or event tracking, landing page, and ad links. Something may be broken."
-                    })
-
-        # Campaign level checks
-        if campaigns_df is not None and not campaigns_df.empty:
-            camp = campaigns_df.copy()
-            camp = to_numeric(camp, ["impressions", "reach", "spend", "ctr"])
-
-            # 4) High frequency campaigns
-            if "impressions" in camp.columns and "reach" in camp.columns:
-                camp["frequency"] = np.where(camp["reach"] > 0, camp["impressions"] / camp["reach"], 0.0)
-                noisy = camp[camp["frequency"] >= 4.0]
-                for _, row in noisy.iterrows():
+        # 5) CPM too high vs account median
+        if "spend" in camp.columns and "impressions" in camp.columns:
+            camp["cpm"] = np.where(camp["impressions"] > 0, camp["spend"] * 1000.0 / camp["impressions"], np.nan)
+            valid = camp[camp["cpm"].notna() & (camp["cpm"] > 0)]
+            if not valid.empty:
+                median_cpm = valid["cpm"].median()
+                high_cpm = valid[valid["cpm"] > median_cpm * 1.6]
+                for _, row in high_cpm.iterrows():
                     cname = row.get("campaign_name", "Unnamed campaign")
-                    freq = row["frequency"]
+                    cpm_val = row["cpm"]
                     issues.append({
                         "level": "medium",
-                        "metric": "Frequency",
+                        "metric": "CPM",
                         "when": "whole period",
-                        "detail": f"Campaign \"{cname}\" has high frequency around {freq:.1f}.",
-                        "suggestion": "Consider refreshing creative or expanding audience to avoid fatigue."
+                        "detail": f"Campaign \"{cname}\" CPM is about RM {cpm_val:.2f}, higher than account median.",
+                        "suggestion": "Tighten targeting or adjust bidding. Also check if creative is relevant to the audience.",
                     })
 
-            # 5) CPM too high vs account median
-            if "spend" in camp.columns and "impressions" in camp.columns:
-                camp["cpm"] = np.where(camp["impressions"] > 0, camp["spend"] * 1000.0 / camp["impressions"], np.nan)
-                valid = camp[camp["cpm"].notna() & (camp["cpm"] > 0)]
-                if not valid.empty:
-                    median_cpm = valid["cpm"].median()
-                    high_cpm = valid[valid["cpm"] > median_cpm * 1.6]
-                    for _, row in high_cpm.iterrows():
-                        cname = row.get("campaign_name", "Unnamed campaign")
-                        cpm_val = row["cpm"]
-                        issues.append({
-                            "level": "medium",
-                            "metric": "CPM",
-                            "when": "whole period",
-                            "detail": f"Campaign \"{cname}\" CPM is about RM {cpm_val:.2f}, higher than account median.",
-                            "suggestion": "Tighten targeting or adjust bidding. Also check if creative is relevant to the audience."
-                        })
+    if not issues:
+        return pd.DataFrame(columns=["level", "metric", "when", "detail", "suggestion"])
 
-        if not issues:
-            return pd.DataFrame(columns=["level", "metric", "when", "detail", "suggestion"])
-
-        return pd.DataFrame(issues)
+    return pd.DataFrame(issues)
 
 def build_local_health_from_campaigns(campaigns_df) -> dict:
     """
@@ -751,6 +786,9 @@ def build_local_health_from_campaigns(campaigns_df) -> dict:
             except Exception:
                 actions = []
 
+        if not isinstance(actions, list):
+            actions = []
+
         rows.append({
             "campaign_id": row.get("campaign_id", ""),
             "campaign_name": row.get("campaign_name", ""),
@@ -785,6 +823,9 @@ def explain_health_with_gemini(
 ) -> str:
     if not GEMINI_API_KEY:
         return "Gemini API key not configured."
+
+    if genai is None:
+        return "Gemini integration is unavailable because google-generativeai is not installed."
 
     model = genai.GenerativeModel("gemini-2.5-flash")
 
@@ -969,6 +1010,8 @@ def main():
         st.session_state.fb_user_name = None
     if "fb_ad_accounts" not in st.session_state:
         st.session_state.fb_ad_accounts = []
+    if "fb_oauth_state" not in st.session_state:
+        st.session_state.fb_oauth_state = None
 
     # ====== Handle OAuth redirect ======
     qp = st.query_params
@@ -983,7 +1026,15 @@ def main():
         st.stop()
 
     # Process the OAuth code if present
+    state_param = qp.get("state")
+
     if st.session_state.fb_user_token is None and code_param:
+        expected_state = st.session_state.get("fb_oauth_state")
+        if expected_state and state_param != expected_state:
+            st.error("State mismatch during Facebook login. Please try signing in again.")
+            st.session_state.fb_oauth_state = None
+            st.stop()
+
         try:
             with st.spinner("Completing sign-in..."):
                 short = fb_exchange_code_for_token(code_param)
@@ -1001,22 +1052,28 @@ def main():
                 )
                 st.session_state.fb_ad_accounts = accs.get("data", [])
 
+                st.session_state.fb_oauth_state = None
                 st.query_params.clear()
                 st.success(f"✅ Signed in as {st.session_state.fb_user_name}")
                 st.rerun()
-                
+        except RuntimeError as e:
+            st.error(f"❌ Login failed: {e}")
+            st.session_state.fb_oauth_state = None
+            st.stop()
         except requests.exceptions.HTTPError as e:
             st.error(f"❌ Facebook API error: {e}")
             try:
                 error_detail = e.response.json()
                 st.json(error_detail)
-            except:
+            except Exception:
                 st.code(e.response.text)
+            st.session_state.fb_oauth_state = None
             st.stop()
         except Exception as e:
             st.error(f"❌ Login failed: {e}")
             import traceback
             st.code(traceback.format_exc())
+            st.session_state.fb_oauth_state = None
             st.stop()
 
     # ====== SIDEBAR: Authentication & Settings ======
@@ -1062,14 +1119,17 @@ def main():
                 if login_method == "Facebook OAuth":
                     st.markdown("### Sign in with Facebook")
                     st.info("Login to access all your ad accounts")
-                    
+
+                    if not st.session_state.fb_oauth_state:
+                        st.session_state.fb_oauth_state = secrets.token_urlsafe(16)
+
                     # with st.expander("🔧 OAuth Debug Info"):
                     #     st.code(f"Redirect URI: {FB_REDIRECT_URI}")
                     #     st.caption("This must match your Facebook App settings")
-                    
+
                     st.link_button(
-                        "🔑 Sign in with Facebook", 
-                        fb_login_url(), 
+                        "🔑 Sign in with Facebook",
+                        fb_login_url(st.session_state.fb_oauth_state),
                         use_container_width=True,
                         type="primary"
                     )
@@ -1137,14 +1197,17 @@ def main():
                 # No profiles, show only OAuth
                 st.markdown("### Sign in with Facebook")
                 st.info("Login to access your ad accounts")
-                
+
                 with st.expander("🔧 OAuth Debug Info"):
                     st.code(f"Redirect URI: {FB_REDIRECT_URI}")
                     st.caption("This must match your Facebook App settings")
-                
+
+                if not st.session_state.fb_oauth_state:
+                    st.session_state.fb_oauth_state = secrets.token_urlsafe(16)
+
                 st.link_button(
-                    "🔑 Sign in with Facebook", 
-                    fb_login_url(), 
+                    "🔑 Sign in with Facebook",
+                    fb_login_url(st.session_state.fb_oauth_state),
                     use_container_width=True,
                     type="primary"
                 )
