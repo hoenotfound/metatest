@@ -294,7 +294,7 @@ FB_APP_ID = _cfg("FB_APP_ID")              # None if not set
 FB_APP_SECRET = _cfg("FB_APP_SECRET")      # None if not set
 # IMPORTANT: Set this to the exact public URL of your Streamlit app page
 # e.g. "https://your-domain.app/app" or when testing locally "http://localhost:8501"
-FB_REDIRECT_URI = _cfg("FB_REDIRECT_URI", "https://dasmarketing.streamlit.app/")
+FB_REDIRECT_URI = _cfg("FB_REDIRECT_URI", "https://metatest.streamlit.app/")
 FB_SCOPES = ["ads_read"]  # add "business_management" if you need broader listing/asset mgmt
 
 GEMINI_API_KEY = _cfg("GEMINI_API_KEY")  # from st.secrets or env
