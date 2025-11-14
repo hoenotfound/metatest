@@ -7,7 +7,18 @@ import importlib
 import importlib.util
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
+# Plotly is optional at import time so we can show a friendly message when it's
+# missing instead of crashing the entire Streamlit app.
+try:
+    import plotly.graph_objects as go
+    import plotly.express as px
+    from plotly.colors import diverging, sequential
+except ModuleNotFoundError as plotly_import_error:  # pragma: no cover - import guard
+    go = None  # type: ignore[assignment]
+    px = None  # type: ignore[assignment]
+    diverging = sequential = None  # type: ignore[assignment]
+else:
+    plotly_import_error = None
 import requests
 import streamlit as st
 
@@ -27,8 +38,6 @@ from facebook_business.adobjects.adcreative import AdCreative
 
 
 # ========== Theming & Palette (Light/Dark aware) ==========
-import plotly.express as px
-from plotly.colors import diverging, sequential
 
 
 def safe_series(df: pd.DataFrame, column: str, default: float = 0.0) -> pd.Series:
@@ -955,6 +964,14 @@ def main():
         layout="wide",
         initial_sidebar_state="expanded"
     )
+
+    if plotly_import_error is not None:
+        st.error(
+            "Plotly is required to render the interactive charts. "
+            "Install it with `pip install plotly` and restart the app."
+        )
+        st.exception(plotly_import_error)
+        st.stop()
 
     # ---- Theme & Plotly defaults ----
     THEME_BASE = get_streamlit_theme_base()
