@@ -1,4 +1,3 @@
-# health_rules.py
 from typing import List, Dict, Any
 from models_health import AccountStats, Issue
 
@@ -10,10 +9,17 @@ def _safe_float(value) -> float:
         return 0.0
 
 
+# Tuned benchmarks for Malaysian beauty clinics (Aesthetic / Skincare / Hair removal)
+MIN_CTR = 0.015            # 1.5 percent
+MAX_CPC = 2.00             # RM2.00 per click
+MAX_CPR = 20.0             # RM20 per result
+MAX_FREQUENCY = 5.0
+MAX_CPM_MULTIPLIER = 1.6
+MIN_SPEND_TO_JUDGE = 20.0
+MIN_RESULTS_FOR_CPR = 5.0
+
+
 def aggregate_account_stats(rows: List[Dict[str, Any]]) -> AccountStats:
-    """
-    Aggregate account level stats from campaign insights.
-    """
     total_spend = 0.0
     total_impressions = 0
     total_clicks = 0
@@ -28,8 +34,7 @@ def aggregate_account_stats(rows: List[Dict[str, Any]]) -> AccountStats:
         total_impressions += impressions
         total_clicks += clicks
 
-        actions = r.get("actions") or []
-        for a in actions:
+        for a in r.get("actions") or []:
             at = (a.get("action_type") or "").strip()
             val = _safe_float(a.get("value"))
             if at in ("purchase", "lead", "complete_registration"):
@@ -51,24 +56,12 @@ def aggregate_account_stats(rows: List[Dict[str, Any]]) -> AccountStats:
 
 
 def detect_issues(rows: List[Dict[str, Any]]) -> List[Issue]:
-    """
-    Run simple health rules on campaign level insights.
-    """
     issues: List[Issue] = []
 
-    # Global benchmarks. You can tune these by client or objective later.
-    MIN_CTR = 0.01             # 1 percent
-    MAX_CPC = 1.50             # RM 1.50 per click
-    MAX_FREQUENCY = 5.0        # above this: fatigue risk
-    MAX_CPM_MULTIPLIER = 1.6   # CPM > 1.6 times account median
-    MIN_SPEND_TO_JUDGE = 20.0  # below this we ignore most checks
-    MIN_RESULTS_FOR_CPR = 5.0  # need enough results before judging CPR
-    MAX_CPR = 20.0             # RM per result, adjust per client
-
-    # Pre compute account CPM median
+    # Compute account median CPM
     cpm_values = []
     for r in rows:
-        spend = _safe_float(r.get("spend", 0))
+        spend = _safe_float(r.get("spend"))
         impressions = int(r.get("impressions", 0) or 0)
         if spend > 0 and impressions > 0:
             cpm_values.append(spend * 1000.0 / impressions)
@@ -77,12 +70,13 @@ def detect_issues(rows: List[Dict[str, Any]]) -> List[Issue]:
     if cpm_values:
         sorted_cpm = sorted(cpm_values)
         mid = len(sorted_cpm) // 2
-        if len(sorted_cpm) % 2 == 1:
-            account_median_cpm = sorted_cpm[mid]
-        else:
-            account_median_cpm = 0.5 * (sorted_cpm[mid - 1] + sorted_cpm[mid])
+        account_median_cpm = (
+            sorted_cpm[mid]
+            if len(sorted_cpm) % 2
+            else 0.5 * (sorted_cpm[mid - 1] + sorted_cpm[mid])
+        )
 
-    # Per campaign checks
+    # Loop through campaigns
     for r in rows:
         cid = r.get("campaign_id", "")
         cname = r.get("campaign_name", "Unnamed campaign")
@@ -94,7 +88,7 @@ def detect_issues(rows: List[Dict[str, Any]]) -> List[Issue]:
 
         actions = r.get("actions") or []
 
-        # 0. Delivery problem: has spend but low impressions
+        # RULE 0: Delivery Issue
         if 0 < spend < MIN_SPEND_TO_JUDGE and impressions < 1000:
             issues.append(Issue(
                 level="low",
@@ -104,53 +98,43 @@ def detect_issues(rows: List[Dict[str, Any]]) -> List[Issue]:
                 value=impressions,
                 benchmark=1000,
                 reason="Campaign has started spending but impressions are still low.",
-                suggestion=(
-                    "Check audience size, learning phase, and any bid or budget limits. "
-                    "Make sure there are no tight rules blocking delivery."
-                ),
+                suggestion="Check audience size and learning phase. Make sure the ad is not restricted by tight rules."
             ))
 
         if spend < MIN_SPEND_TO_JUDGE:
-            # Too small to judge for deeper performance
             continue
 
         ctr = (clicks / impressions) if impressions else 0.0
         cpc = (spend / clicks) if clicks else 0.0
         cpm = (spend * 1000.0 / impressions) if impressions else 0.0
 
-        # 1. Low CTR
+        # RULE 1: Low CTR
         if ctr < MIN_CTR:
             issues.append(Issue(
                 level="high",
                 campaign_id=cid,
                 campaign_name=cname,
                 metric="CTR",
-                value=round(ctr * 100, 2),     # store as percent
+                value=round(ctr * 100, 2),
                 benchmark=MIN_CTR * 100,
-                reason="CTR is lower than the simple baseline for this account.",
-                suggestion=(
-                    "Refresh creatives and test stronger hooks in the main text. "
-                    "Use more eye catching images or short videos."
-                ),
+                reason="CTR is low for a beauty audience.",
+                suggestion="Refresh your creative. Use clearer before/after, stronger hook text, and shorter videos."
             ))
 
-        # 2. High CPC
+        # RULE 2: High CPC
         if cpc > MAX_CPC:
             issues.append(Issue(
                 level="medium",
                 campaign_id=cid,
                 campaign_name=cname,
                 metric="CPC",
-                value=round(cpc, 3),
+                value=round(cpc, 2),
                 benchmark=MAX_CPC,
-                reason="Cost per click is high for the current spend.",
-                suggestion=(
-                    "Review targeting and placements. Test broader audiences or cheaper placements, "
-                    "and pause weak ads with very low CTR."
-                ),
+                reason="Clicks are expensive for this spend level.",
+                suggestion="Try broader audiences or cheaper placements. Test a simpler headline."
             ))
 
-        # 3. High frequency (fatigue risk)
+        # RULE 3: High Frequency (Beauty audiences fatigue very fast)
         if freq > MAX_FREQUENCY:
             issues.append(Issue(
                 level="medium",
@@ -159,15 +143,12 @@ def detect_issues(rows: List[Dict[str, Any]]) -> List[Issue]:
                 metric="Frequency",
                 value=round(freq, 2),
                 benchmark=MAX_FREQUENCY,
-                reason="People have seen this ad many times. There is a risk of ad fatigue.",
-                suggestion=(
-                    "Rotate fresh creatives or reduce budget for this campaign. "
-                    "Consider opening new audiences instead of pushing the same group."
-                ),
+                reason="People have seen this ad too many times.",
+                suggestion="Rotate new creatives or reduce budget. Beauty audiences burn out quickly."
             ))
 
-        # 4. High CPM vs account median
-        if account_median_cpm and cpm > account_median_cpm * MAX_CPM_MULTIPLIER:
+        # RULE 4: High CPM
+        if account_median_cpm is not None and cpm > account_median_cpm * MAX_CPM_MULTIPLIER:
             issues.append(Issue(
                 level="medium",
                 campaign_id=cid,
@@ -175,17 +156,15 @@ def detect_issues(rows: List[Dict[str, Any]]) -> List[Issue]:
                 metric="CPM",
                 value=round(cpm, 2),
                 benchmark=round(account_median_cpm, 2),
-                reason="This campaign is paying much more per 1000 views than the account median.",
-                suggestion=(
-                    "Tighten targeting or adjust bidding. Check if the creative fits the audience, "
-                    "or move spend into better performing campaigns."
-                ),
+                reason="Paying more per 1000 views than the account average.",
+                suggestion="Check if the creative matches the audience. Try wider targeting or remove narrow filters."
             ))
 
-        # 5. Clicks but no deeper results (LPV or messages)
+        # Collect deeper actions
         lpv = 0.0
         msg = 0.0
         results = 0.0
+
         for a in actions:
             at = (a.get("action_type") or "").strip()
             val = _safe_float(a.get("value"))
@@ -196,6 +175,7 @@ def detect_issues(rows: List[Dict[str, Any]]) -> List[Issue]:
             if at in ("purchase", "lead", "complete_registration"):
                 results += val
 
+        # RULE 5: Clicks but no LPV / Messages
         if clicks >= 100 and (lpv + msg) < 1:
             issues.append(Issue(
                 level="high",
@@ -204,16 +184,13 @@ def detect_issues(rows: List[Dict[str, Any]]) -> List[Issue]:
                 metric="Conversions",
                 value=0.0,
                 benchmark=None,
-                reason="Campaign has spend and clicks but almost no landing page views or messages.",
-                suggestion=(
-                    "Check the URL and event setup. Make sure the landing page loads fast "
-                    "and the link is correct in every ad."
-                ),
+                reason="Clicks but almost no landing page views or messages.",
+                suggestion="Check your link. Make sure the landing page loads fast. Avoid slow funnels."
             ))
 
-        # 6. Expensive results (CPL / CPA) using results from actions
+        # RULE 6: Cost per result too high
         if results >= MIN_RESULTS_FOR_CPR:
-            cpr = spend / results if results else 0.0
+            cpr = spend / results
             if cpr > MAX_CPR:
                 issues.append(Issue(
                     level="high",
@@ -222,30 +199,40 @@ def detect_issues(rows: List[Dict[str, Any]]) -> List[Issue]:
                     metric="CPR",
                     value=round(cpr, 2),
                     benchmark=MAX_CPR,
-                    reason="Cost per result is high compared to a simple benchmark.",
-                    suggestion=(
-                        "Narrow targeting to higher intent audiences and improve the offer on the landing page. "
-                        "Pause ad sets with very high cost per result."
-                    ),
+                    reason="Cost per result is high for a beauty clinic.",
+                    suggestion="Improve your offer or retarget higher-intent users."
+                ))
+
+        # EXTRA RULE 7: Creative Fatigue Detection (CTR drop)
+        # If the row has past CTR trend: r["ctr_trend"] = [day1, day2, day3]
+        ctr_trend = r.get("ctr_trend")
+        if ctr_trend and len(ctr_trend) >= 3:
+            if ctr_trend[-1] < ctr_trend[-2] < ctr_trend[-3]:
+                issues.append(Issue(
+                    level="medium",
+                    campaign_id=cid,
+                    campaign_name=cname,
+                    metric="Creative Fatigue",
+                    value=round(ctr_trend[-1] * 100, 2),
+                    benchmark=None,
+                    reason="CTR has dropped 3 days in a row.",
+                    suggestion="Change the creative. Beauty ads decline faster than most industries."
                 ))
 
     return issues
 
 
 def build_summary(account_stats: AccountStats, issues: List[Issue]) -> str:
-    """
-    Short human summary string for the account.
-    """
     if not issues:
         return (
-            f"Account looks healthy. Spend RM{account_stats.spend:.2f} over "
-            f"{account_stats.impressions} impressions and {account_stats.clicks} clicks."
+            f"Account looks healthy. Spend RM{account_stats.spend:.2f} "
+            f"across {account_stats.impressions} impressions and {account_stats.clicks} clicks."
         )
 
     high = sum(1 for i in issues if i.level == "high")
     med = sum(1 for i in issues if i.level == "medium")
 
     return (
-        f"Found {len(issues)} issues in this period "
+        f"Found {len(issues)} issues this period "
         f"({high} high, {med} medium). Total spend RM{account_stats.spend:.2f}."
     )
